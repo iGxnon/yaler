@@ -61,6 +61,10 @@ fn build_ssl_config(sni: &str, skip_verify: bool) -> Result<boring::ssl::Connect
     // ALPN: h2 preferred, then http/1.1 (Chrome order)
     builder.set_alpn_protos(b"\x02h2\x08http/1.1")?;
 
+    // Load system CA bundle so BoringSSL can verify real certificates
+    // (e.g. Let's Encrypt). Without this BoringSSL has an empty trust store.
+    builder.set_default_verify_paths()?;
+
     if skip_verify {
         builder.set_verify(SslVerifyMode::NONE);
     }
