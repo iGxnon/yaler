@@ -1,54 +1,89 @@
 use anyhow::{Context, Result};
 use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
+use bytes::Bytes;
+use http::{Method, Request, StatusCode};
+use std::future::poll_fn;
 use tokio::net::TcpStream;
-use tokio_tungstenite::{client_async, tungstenite::client::IntoClientRequest, WebSocketStream};
 
-pub type WsStream = WebSocketStream<tokio_boring::SslStream<TcpStream>>;
+use crate::proto::Target;
 
-/// Connect to the remote server with a Chrome-like TLS fingerprint and upgrade
-/// to WebSocket.  Returns the WebSocketStream ready for the tunnel handshake.
+pub type H2Streams = (h2::SendStream<Bytes>, h2::RecvStream);
+
+/// Establish an HTTP/2 POST tunnel to the remote server with a Chrome-like
+/// TLS fingerprint. Returns the two h2 stream halves ready for relay.
+///
+/// Metadata (password, target host/port) is carried in HTTP headers so it
+/// works transparently through HTTP/2-aware middleboxes.
 pub async fn connect(
     server: &str,
     port: u16,
-    path: &str,
     sni: &str,
     skip_verify: bool,
-) -> Result<WsStream> {
+    password: &str,
+    target: &Target,
+) -> Result<H2Streams> {
     let tcp = TcpStream::connect(format!("{server}:{port}"))
         .await
         .with_context(|| format!("TCP connect to {server}:{port}"))?;
 
-    let config = build_ssl_config(sni, skip_verify)?;
-    let tls = tokio_boring::connect(config, sni, tcp)
+    let ssl_cfg = build_ssl_config(sni, skip_verify)?;
+    let tls = tokio_boring::connect(ssl_cfg, sni, tcp)
         .await
-        .map_err(|e| anyhow::anyhow!("TLS handshake: {e:#?}"))?;
+        .map_err(|e| anyhow::anyhow!("TLS handshake: {e:#}"))?;
 
-    let url = format!("wss://{}:{}{}", sni, port, path);
-    let request = url
-        .into_client_request()
-        .context("build WebSocket request")?;
-
-    let (ws, _) = client_async(request, tls)
+    let (mut client, h2_conn) = h2::client::Builder::new()
+        .initial_window_size(1 << 20)
+        .initial_connection_window_size(2 << 20)
+        .handshake::<_, Bytes>(tls)
         .await
-        .context("WebSocket handshake")?;
+        .context("HTTP/2 handshake")?;
 
-    Ok(ws)
+    tokio::spawn(async move {
+        if let Err(e) = h2_conn.await {
+            tracing::debug!("h2 connection driver: {e:#}");
+        }
+    });
+
+    poll_fn(|cx| client.poll_ready(cx))
+        .await
+        .context("h2 client poll_ready")?;
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("https://{}:{}", sni, port))
+        .header("x-pw", password)
+        .header("x-host", &target.host)
+        .header("x-port", target.port.to_string())
+        .body(())
+        .context("build POST request")?;
+
+    let (resp_future, send) = client
+        .send_request(req, false)
+        .context("send POST request")?;
+
+    let resp = resp_future.await.context("await POST response")?;
+
+    if resp.status() != StatusCode::OK {
+        return Err(anyhow::anyhow!(
+            "server rejected tunnel to {}:{} — {}",
+            target.host,
+            target.port,
+            resp.status()
+        ));
+    }
+
+    let recv = resp.into_body();
+    Ok((send, recv))
 }
 
-/// Build a BoringSSL `ConnectConfiguration` that mimics Chrome's TLS ClientHello.
-///
-/// Chrome is built on BoringSSL, so BoringSSL defaults already produce the
-/// correct GREASE values and extension ordering.  We additionally pin the
-/// cipher suite list and ALPN to match a recent Chrome release.
+/// Build a BoringSSL ConnectConfiguration with Chrome-like TLS fingerprint.
 fn build_ssl_config(sni: &str, skip_verify: bool) -> Result<boring::ssl::ConnectConfiguration> {
     let mut builder =
         SslConnector::builder(SslMethod::tls_client()).context("SslConnector builder")?;
 
-    // TLS 1.2–1.3 only (Chrome dropped TLS 1.0/1.1)
     builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
     builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
 
-    // Chrome TLS 1.2 cipher suite order (as of Chrome 120+)
     builder.set_cipher_list(concat!(
         "ECDHE-ECDSA-AES128-GCM-SHA256:",
         "ECDHE-RSA-AES128-GCM-SHA256:",
@@ -64,12 +99,9 @@ fn build_ssl_config(sni: &str, skip_verify: bool) -> Result<boring::ssl::Connect
         "AES256-SHA"
     ))?;
 
-    // WebSocket requires HTTP/1.1 upgrade; offering h2 causes Cloudflare and
-    // other HTTP/2 middleboxes to negotiate h2 and reject the WS handshake.
-    builder.set_alpn_protos(b"\x08http/1.1")?;
+    // HTTP/2 requires h2 in ALPN
+    builder.set_alpn_protos(b"\x02h2")?;
 
-    // Load system CA bundle so BoringSSL can verify real certificates
-    // (e.g. Let's Encrypt). Without this BoringSSL has an empty trust store.
     builder.set_default_verify_paths()?;
 
     if skip_verify {
@@ -79,7 +111,6 @@ fn build_ssl_config(sni: &str, skip_verify: bool) -> Result<boring::ssl::Connect
     let connector = builder.build();
     let mut config = connector.configure().context("SslConnector configure")?;
     config.set_verify_hostname(!skip_verify);
-    // SNI is passed separately to tokio_boring::connect
     let _ = sni;
     Ok(config)
 }
