@@ -16,30 +16,25 @@ name = "yaler"
 path = "src/lib.rs"
 
 [dependencies]
-# Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# WebSocket — client side uses tokio-tungstenite over a pre-built TLS stream
-tokio-tungstenite = "0.21"
-tungstenite = "0.21"
-futures-util = "0.3"
+# HTTP/2 tunnel (replaces WebSocket)
+h2 = "0.4"
+http = "1"
+bytes = "1"
 
-# HTTP / WebSocket server
-axum = { version = "0.8", features = ["ws"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
-
-# Server-side TLS (rustls)
+# Server-side TLS
+tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 rcgen = "0.11"
 
-# Client-side TLS — BoringSSL enables Chrome TLS fingerprint (uTLS)
+# Client-side TLS with Chrome fingerprint (BoringSSL)
 boring = "4"
 tokio-boring = "4"
 
-# Config / serialization
+# Config
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 toml = "0.8"
 
 # CLI
@@ -49,6 +44,5 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Utilities
+# Error handling
 anyhow = "1"
-bytes = "1"

@@ -1,5 +1,4 @@
 # yaler server — local dev config
 listen   = "127.0.0.1:8443"
-path     = "/ws"
 password = "testpass"
 # cert/key omitted → auto-generated self-signed cert

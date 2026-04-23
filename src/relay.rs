@@ -1,46 +1,64 @@
 use anyhow::Result;
-use futures_util::{SinkExt, StreamExt};
+use bytes::Bytes;
+use std::future::poll_fn;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 
-/// Bidirectional relay between a tungstenite WebSocketStream and a raw TcpStream.
+/// Bidirectional relay between an HTTP/2 stream and a raw TcpStream.
 ///
-/// Used on the **client** side: ws is the tunnel to the remote server,
-/// tcp is the inbound connection from the local user application.
-pub async fn relay_ws_tcp<S>(ws: WebSocketStream<S>, tcp: TcpStream) -> Result<()>
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
-    let (mut ws_tx, mut ws_rx) = ws.split();
-    let (mut tcp_rx, mut tcp_tx) = tcp.into_split();
+/// `send` / `recv` are the two halves of an h2 CONNECT stream (client or server side).
+/// `tcp` is the raw TCP connection to the proxied target (server side) or the
+/// local user application (client side).
+pub async fn relay_h2_tcp(
+    mut send: h2::SendStream<Bytes>,
+    mut recv: h2::RecvStream,
+    tcp: TcpStream,
+) -> Result<()> {
+    let (mut tcp_r, mut tcp_w) = tcp.into_split();
+    let mut buf = vec![0u8; 65536];
 
-    let ws_to_tcp = async move {
-        while let Some(msg) = ws_rx.next().await {
-            match msg? {
-                Message::Binary(data) => tcp_tx.write_all(&data).await?,
-                Message::Close(_) => break,
-                _ => {}
+    let h2_to_tcp = async {
+        loop {
+            match poll_fn(|cx| recv.poll_data(cx)).await {
+                Some(Ok(data)) => {
+                    recv.flow_control().release_capacity(data.len())?;
+                    tcp_w.write_all(&data).await?;
+                }
+                Some(Err(e)) => {
+                    // RST_STREAM from the remote is a normal connection close, not an error.
+                    if e.is_reset() {
+                        break;
+                    }
+                    return Err(anyhow::anyhow!("h2 recv: {e:#}"));
+                }
+                None => break,
             }
         }
         Ok::<_, anyhow::Error>(())
     };
 
-    let tcp_to_ws = async move {
-        let mut buf = vec![0u8; 65536];
+    let tcp_to_h2 = async {
         loop {
-            let n = tcp_rx.read(&mut buf).await?;
+            let n = tcp_r.read(&mut buf).await?;
             if n == 0 {
                 break;
             }
-            ws_tx.send(Message::Binary(buf[..n].to_vec())).await?;
+            let chunk = Bytes::copy_from_slice(&buf[..n]);
+            send.reserve_capacity(chunk.len());
+            match poll_fn(|cx| send.poll_capacity(cx)).await {
+                None | Some(Err(_)) => break, // stream closed by remote
+                Some(Ok(_)) => {}
+            }
+            if send.send_data(chunk, false).is_err() {
+                break; // remote reset the stream
+            }
         }
-        ws_tx.close().await.ok();
+        send.send_data(Bytes::new(), true).ok();
         Ok::<_, anyhow::Error>(())
     };
 
     tokio::select! {
-        r = ws_to_tcp => r,
-        r = tcp_to_ws => r,
+        r = h2_to_tcp => r,
+        r = tcp_to_h2 => r,
     }
 }

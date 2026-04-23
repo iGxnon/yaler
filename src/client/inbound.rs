@@ -1,13 +1,13 @@
-use anyhow::{anyhow, Result};
-use futures_util::{SinkExt, StreamExt};
+use anyhow::Result;
+use bytes::Bytes;
+use std::future::poll_fn;
 use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info};
 
-use crate::config::ClientConfig;
-use crate::proto::{ConnectReq, ConnectResp, Target};
-use crate::relay::relay_ws_tcp;
 use super::http::HttpRequest;
+use crate::config::ClientConfig;
+use crate::proto::Target;
+use crate::relay::relay_h2_tcp;
 
 pub async fn run(cfg: ClientConfig) -> Result<()> {
     let listener = TcpListener::bind(&cfg.listen).await?;
@@ -28,7 +28,6 @@ async fn handle(mut stream: TcpStream, cfg: ClientConfig) -> Result<()> {
     let mut peek = [0u8; 1];
     stream.peek(&mut peek).await?;
 
-    // Dispatch by protocol: SOCKS5 starts with 0x05, everything else is HTTP.
     let (target, prefix): (Target, Vec<u8>) = if peek[0] == 0x05 {
         (super::socks5::handshake(&mut stream).await?, vec![])
     } else {
@@ -40,42 +39,25 @@ async fn handle(mut stream: TcpStream, cfg: ClientConfig) -> Result<()> {
 
     info!("proxying {}:{}", target.host, target.port);
 
-    // ── Open WebSocket tunnel to the remote server ────────────────────────────
-    let mut ws = super::outbound::connect(
+    let (mut send, recv) = super::outbound::connect(
         &cfg.server,
         cfg.port,
-        &cfg.path,
         &cfg.sni,
         cfg.skip_verify,
+        &cfg.password,
+        &target,
     )
     .await?;
 
-    let req = ConnectReq { pw: cfg.password.clone(), host: target.host.clone(), port: target.port };
-    ws.send(Message::Text(serde_json::to_string(&req)?)).await?;
-
-    let resp_msg = ws
-        .next()
-        .await
-        .ok_or_else(|| anyhow!("server closed before responding"))??;
-    match resp_msg {
-        Message::Text(t) => {
-            let resp: ConnectResp = serde_json::from_str(&t)?;
-            if !resp.ok {
-                return Err(anyhow!(
-                    "server refused {}:{}: {}",
-                    target.host,
-                    target.port,
-                    resp.err.unwrap_or_default()
-                ));
-            }
-        }
-        _ => return Err(anyhow!("unexpected message during tunnel handshake")),
-    }
-
-    // For plain HTTP forwarding, send the rewritten request before relay.
+    // For plain HTTP forwarding, send the rewritten request as the first data chunk.
     if !prefix.is_empty() {
-        ws.send(Message::Binary(prefix.into())).await?;
+        send.reserve_capacity(prefix.len());
+        poll_fn(|cx| send.poll_capacity(cx))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("h2 send stream closed"))??;
+        send.send_data(Bytes::from(prefix), false)
+            .map_err(|e| anyhow::anyhow!("send prefix: {e:#}"))?;
     }
 
-    relay_ws_tcp(ws, stream).await
+    relay_h2_tcp(send, recv, stream).await
 }

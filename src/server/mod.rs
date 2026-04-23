@@ -1,61 +1,90 @@
 mod handler;
 
-use anyhow::Result;
-use axum::{
-    extract::{State, WebSocketUpgrade},
-    response::Response,
-    routing::get,
-    Router,
-};
-use axum_server::tls_rustls::RustlsConfig;
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
+use rustls::ServerConfig as RustlsServerConfig;
 use std::sync::Arc;
-use tracing::info;
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
+use tracing::{error, info};
 
 use crate::config::ServerConfig;
 
-#[derive(Clone)]
-struct AppState {
-    password: Arc<String>,
-}
-
 pub async fn run(cfg: ServerConfig) -> Result<()> {
-    let state = AppState {
-        password: Arc::new(cfg.password.clone()),
-    };
-
-    let path = cfg.path.clone();
-    let app = Router::new()
-        .route(&path, get(ws_handler))
-        .with_state(state);
-
-    let tls = build_tls_config(&cfg).await?;
+    let acceptor = build_tls_acceptor(&cfg)?;
+    let listener = TcpListener::bind(&cfg.listen).await?;
+    let password = Arc::new(cfg.password.clone());
 
     info!("server listening on {}", cfg.listen);
-    axum_server::bind_rustls(cfg.listen.parse()?, tls)
-        .serve(app.into_make_service())
+
+    loop {
+        let (tcp, _peer) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let password = password.clone();
+
+        tokio::spawn(async move {
+            let tls = match acceptor.accept(tcp).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("TLS accept: {e:#}");
+                    return;
+                }
+            };
+            if let Err(e) = serve_h2(tls, password).await {
+                error!("h2 connection: {e:#}");
+            }
+        });
+    }
+}
+
+async fn serve_h2<S>(stream: S, password: Arc<String>) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut conn = h2::server::Builder::new()
+        .initial_window_size(1 << 20)
+        .initial_connection_window_size(2 << 20)
+        .enable_connect_protocol()
+        .handshake::<_, Bytes>(stream)
         .await?;
+
+    while let Some(result) = conn.accept().await {
+        let (req, respond) = result?;
+        let pw = password.as_ref().clone();
+        tokio::spawn(async move {
+            if let Err(e) = handler::handle(req, respond, pw).await {
+                error!("handler: {e:#}");
+            }
+        });
+    }
 
     Ok(())
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    let pw = state.password.as_ref().clone();
-    ws.on_upgrade(move |socket| handler::handle(socket, pw))
-}
+fn build_tls_acceptor(cfg: &ServerConfig) -> Result<TlsAcceptor> {
+    let (certs, key) = if let (Some(cert_path), Some(key_path)) = (&cfg.cert, &cfg.key) {
+        let cert_pem = std::fs::read(cert_path)?;
+        let key_pem = std::fs::read(key_path)?;
+        let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
+            .collect::<Result<Vec<_>, _>>()?;
+        let key = rustls_pemfile::private_key(&mut key_pem.as_slice())?
+            .ok_or_else(|| anyhow!("no private key in {key_path}"))?;
+        (certs, key)
+    } else {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.serialize_der()?);
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            cert.serialize_private_key_der().into(),
+        );
+        tracing::warn!("using auto-generated self-signed certificate");
+        (vec![cert_der], key_der)
+    };
 
-async fn build_tls_config(cfg: &ServerConfig) -> Result<RustlsConfig> {
-    match (&cfg.cert, &cfg.key) {
-        (Some(cert), Some(key)) => Ok(RustlsConfig::from_pem_file(cert, key).await?),
-        _ => {
-            let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
-            let cert_pem = cert.serialize_pem()?;
-            let key_pem = cert.serialize_private_key_pem();
-            tracing::warn!("using auto-generated self-signed certificate");
-            Ok(RustlsConfig::from_pem(
-                cert_pem.into_bytes(),
-                key_pem.into_bytes(),
-            )
-            .await?)
-        }
-    }
+    let mut rustls_cfg = RustlsServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    rustls_cfg.alpn_protocols = vec![b"h2".to_vec()];
+
+    Ok(TlsAcceptor::from(Arc::new(rustls_cfg)))
 }
