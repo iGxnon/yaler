@@ -18,7 +18,7 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
         let cfg = cfg.clone();
         tokio::spawn(async move {
             if let Err(e) = handle(stream, cfg).await {
-                error!("connection from {peer}: {e}");
+                error!("connection from {peer}: {e:#}");
             }
         });
     }

@@ -7,7 +7,13 @@ pub type WsStream = WebSocketStream<tokio_boring::SslStream<TcpStream>>;
 
 /// Connect to the remote server with a Chrome-like TLS fingerprint and upgrade
 /// to WebSocket.  Returns the WebSocketStream ready for the tunnel handshake.
-pub async fn connect(server: &str, port: u16, path: &str, sni: &str, skip_verify: bool) -> Result<WsStream> {
+pub async fn connect(
+    server: &str,
+    port: u16,
+    path: &str,
+    sni: &str,
+    skip_verify: bool,
+) -> Result<WsStream> {
     let tcp = TcpStream::connect(format!("{server}:{port}"))
         .await
         .with_context(|| format!("TCP connect to {server}:{port}"))?;
@@ -15,7 +21,7 @@ pub async fn connect(server: &str, port: u16, path: &str, sni: &str, skip_verify
     let config = build_ssl_config(sni, skip_verify)?;
     let tls = tokio_boring::connect(config, sni, tcp)
         .await
-        .map_err(|e| anyhow::anyhow!("TLS handshake: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("TLS handshake: {e:#?}"))?;
 
     let url = format!("wss://{}:{}{}", sni, port, path);
     let request = url
@@ -35,8 +41,8 @@ pub async fn connect(server: &str, port: u16, path: &str, sni: &str, skip_verify
 /// correct GREASE values and extension ordering.  We additionally pin the
 /// cipher suite list and ALPN to match a recent Chrome release.
 fn build_ssl_config(sni: &str, skip_verify: bool) -> Result<boring::ssl::ConnectConfiguration> {
-    let mut builder = SslConnector::builder(SslMethod::tls_client())
-        .context("SslConnector builder")?;
+    let mut builder =
+        SslConnector::builder(SslMethod::tls_client()).context("SslConnector builder")?;
 
     // TLS 1.2–1.3 only (Chrome dropped TLS 1.0/1.1)
     builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
@@ -58,8 +64,9 @@ fn build_ssl_config(sni: &str, skip_verify: bool) -> Result<boring::ssl::Connect
         "AES256-SHA"
     ))?;
 
-    // ALPN: h2 preferred, then http/1.1 (Chrome order)
-    builder.set_alpn_protos(b"\x02h2\x08http/1.1")?;
+    // WebSocket requires HTTP/1.1 upgrade; offering h2 causes Cloudflare and
+    // other HTTP/2 middleboxes to negotiate h2 and reject the WS handshake.
+    builder.set_alpn_protos(b"\x08http/1.1")?;
 
     // Load system CA bundle so BoringSSL can verify real certificates
     // (e.g. Let's Encrypt). Without this BoringSSL has an empty trust store.
