@@ -9,7 +9,7 @@ use crate::proto::{ConnectReq, ConnectResp};
 
 pub async fn handle(mut ws: WebSocket, password: String) {
     if let Err(e) = handle_inner(&mut ws, &password).await {
-        error!("handler: {e}");
+        error!("handler: {e:#?}");
     }
 }
 
@@ -42,7 +42,7 @@ async fn handle_inner(ws: &mut WebSocket, password: &str) -> Result<()> {
                 serde_json::to_string(&ConnectResp::err(e.to_string()))?.into(),
             ))
             .await?;
-            return Err(anyhow!("connect {addr}: {e}"));
+            return Err(anyhow!("connect {addr}: {e:#?}"));
         }
     };
 
