@@ -52,3 +52,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Utilities
 anyhow = "1"
 bytes = "1"
+rand = "0.8"

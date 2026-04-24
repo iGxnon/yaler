@@ -8,7 +8,7 @@ pub struct ServerConfig {
     pub cert: Option<String>,
     /// Path to PEM key file
     pub key: Option<String>,
-    /// WebSocket upgrade path (e.g. "/ws")
+    /// WebSocket upgrade path (e.g. "/sw")
     pub path: String,
     /// Shared password for client authentication
     pub password: String,
@@ -20,7 +20,7 @@ impl Default for ServerConfig {
             listen: "0.0.0.0:443".to_string(),
             cert: None,
             key: None,
-            path: "/ws".to_string(),
+            path: "/sw".to_string(),
             password: "changeme".to_string(),
         }
     }
@@ -58,7 +58,7 @@ impl Default for ClientConfig {
             listen: "127.0.0.1:1080".to_string(),
             server: "127.0.0.1".to_string(),
             port: 443,
-            path: "/ws".to_string(),
+            path: "/sw".to_string(),
             password: "changeme".to_string(),
             sni: "example.com".to_string(),
             skip_verify: false,

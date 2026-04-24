@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use boring::ssl::{SslConnector, SslMethod, SslVerifyMode, SslVersion};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{client_async, tungstenite::client::IntoClientRequest, WebSocketStream};
+use tokio_tungstenite::{client_async, tungstenite, WebSocketStream};
 
 pub type WsStream = WebSocketStream<tokio_boring::SslStream<TcpStream>>;
 
 /// Connect to the remote server with a Chrome-like TLS fingerprint and upgrade
-/// to WebSocket.  Returns the WebSocketStream ready for the tunnel handshake.
+/// to WebSocket with browser-realistic HTTP headers.
 pub async fn connect(
     server: &str,
     port: u16,
@@ -23,16 +23,59 @@ pub async fn connect(
         .await
         .map_err(|e| anyhow::anyhow!("TLS handshake: {e:#?}"))?;
 
-    let url = format!("wss://{}:{}{}", sni, port, path);
-    let request = url
-        .into_client_request()
-        .context("build WebSocket request")?;
+    let request = build_ws_request(sni, port, path)?;
 
     let (ws, _) = client_async(request, tls)
         .await
         .context("WebSocket handshake")?;
 
     Ok(ws)
+}
+
+/// Build a WebSocket upgrade request that mimics what a real Chrome browser
+/// sends, including Origin, User-Agent, and standard HTTP headers.
+fn build_ws_request(
+    sni: &str,
+    port: u16,
+    path: &str,
+) -> Result<tungstenite::handshake::client::Request> {
+    let url = if port == 443 {
+        format!("wss://{sni}{path}")
+    } else {
+        format!("wss://{sni}:{port}{path}")
+    };
+
+    let origin = if port == 443 {
+        format!("https://{sni}")
+    } else {
+        format!("https://{sni}:{port}")
+    };
+
+    let request = tungstenite::handshake::client::Request::builder()
+        .uri(&url)
+        .header("Host", sni)
+        .header("Origin", origin)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+             AppleWebKit/537.36 (KHTML, like Gecko) \
+             Chrome/124.0.0.0 Safari/537.36",
+        )
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Accept-Encoding", "gzip, deflate, br")
+        .header("Cache-Control", "no-cache")
+        .header("Pragma", "no-cache")
+        .header("Upgrade", "websocket")
+        .header("Connection", "Upgrade")
+        .header("Sec-WebSocket-Version", "13")
+        .header(
+            "Sec-WebSocket-Key",
+            tungstenite::handshake::client::generate_key(),
+        )
+        .body(())
+        .context("build WebSocket request")?;
+
+    Ok(request)
 }
 
 /// Build a BoringSSL `ConnectConfiguration` that mimics Chrome's TLS ClientHello.
@@ -68,8 +111,7 @@ fn build_ssl_config(skip_verify: bool) -> Result<boring::ssl::ConnectConfigurati
     // other HTTP/2 middleboxes to negotiate h2 and reject the WS handshake.
     builder.set_alpn_protos(b"\x08http/1.1")?;
 
-    // Load system CA bundle so BoringSSL can verify real certificates
-    // (e.g. Let's Encrypt). Without this BoringSSL has an empty trust store.
+    // Load system CA bundle so BoringSSL can verify real certificates.
     builder.set_default_verify_paths()?;
 
     if skip_verify {

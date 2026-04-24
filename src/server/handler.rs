@@ -8,14 +8,36 @@ use crate::relay::relay_session;
 
 pub async fn handle(mut ws: WebSocket, password: String) {
     if let Err(e) = handle_inner(&mut ws, &password).await {
+        // BoringSSL (client) often closes the TCP connection without sending a
+        // TLS close_notify when returning a connection to its pool. rustls is
+        // strict about this per spec, but it is not a real error — treat it as
+        // a normal close.
+        let s = format!("{e:#}");
+        if s.contains("close_notify") {
+            return;
+        }
         error!("handler: {e:#}");
     }
 }
 
-/// Loop over sequential tunnel sessions on the same WebSocket connection.
-/// Each iteration performs the ConnectReq handshake and then relays data.
-/// Returning Ok(()) from a relay means the session ended cleanly; we loop
-/// back so the client can reuse the connection for the next request.
+/// Constant-time byte comparison to prevent timing-based password guessing.
+fn password_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        // Still run a dummy comparison to avoid immediate early-return on length.
+        let _ = a
+            .iter()
+            .zip(a.iter())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y));
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 async fn handle_inner(ws: &mut WebSocket, password: &str) -> Result<()> {
     loop {
         let msg = match ws.recv().await {
@@ -29,12 +51,18 @@ async fn handle_inner(ws: &mut WebSocket, password: &str) -> Result<()> {
             _ => return Err(anyhow!("expected text frame for handshake")),
         };
 
-        if req.pw != password {
+        if !password_eq(&req.pw, password) {
             ws.send(Message::Text(
                 serde_json::to_string(&ConnectResp::err("unauthorized"))?.into(),
             ))
             .await?;
             return Err(anyhow!("unauthorized client"));
+        }
+
+        if req.udp {
+            info!("UDP relay session started");
+            crate::server::udp::relay(ws).await?;
+            return Ok(());
         }
 
         let addr = format!("{}:{}", req.host, req.port);

@@ -60,8 +60,8 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<HttpRequest> {
         let path = extract_path(url);
         let version = parts.next().unwrap_or("HTTP/1.1");
         let rest = text
-            .splitn(2, '\n')
-            .nth(1)
+            .split_once('\n')
+            .map(|x| x.1)
             .unwrap_or("")
             .trim_start_matches('\r');
         let rewritten = format!("{method} {path} {version}\r\n{rest}");

@@ -34,7 +34,14 @@ async fn handle(mut stream: TcpStream, cfg: ClientConfig, pool: Arc<Pool>) -> Re
     stream.peek(&mut peek).await?;
 
     let (target, prefix): (Target, Vec<u8>) = if peek[0] == 0x05 {
-        (super::socks5::handshake(&mut stream).await?, vec![])
+        match super::socks5::handshake(&mut stream).await? {
+            super::socks5::SocksTarget::Connect(t) => (t, vec![]),
+            // For UDP ASSOCIATE, `stream` becomes the SOCKS5 ctrl connection.
+            // Pass ownership to the UDP relay; it keeps it alive until done.
+            super::socks5::SocksTarget::UdpAssociate { udp_socket } => {
+                return super::udp::client_relay(udp_socket, stream, &cfg).await;
+            }
+        }
     } else {
         match super::http::handshake(&mut stream).await? {
             HttpRequest::Connect(t) => (t, vec![]), // https
@@ -48,6 +55,7 @@ async fn handle(mut stream: TcpStream, cfg: ClientConfig, pool: Arc<Pool>) -> Re
         pw: cfg.password.clone(),
         host: target.host.clone(),
         port: target.port,
+        udp: false,
     };
 
     let mut ws = acquire_tunnel(&cfg, &pool, &req).await?;
@@ -87,7 +95,7 @@ async fn acquire_tunnel(cfg: &ClientConfig, pool: &Pool, req: &ConnectReq) -> Re
     Ok(ws)
 }
 
-async fn do_handshake(ws: &mut WsStream, req_text: &str) -> Result<()> {
+pub async fn do_handshake(ws: &mut WsStream, req_text: &str) -> Result<()> {
     ws.send(Message::Text(req_text.to_owned())).await?;
 
     let msg = ws
