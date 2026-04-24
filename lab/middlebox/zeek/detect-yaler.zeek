@@ -96,19 +96,82 @@ event connection_state_remove(c: connection) {
 }
 
 # ── 3. TLS cipher / version fingerprinting ────────────────────────────────────
-# Logs each TLS client hello's version, ciphers, and SNI for JA3 comparison.
-# Actual JA3 hash computation is done offline by analyze.sh using tshark.
+# Assembles the JA3 raw string across multiple SSL events:
+#   Version,Ciphers,Extensions,EllipticCurves,EllipticCurvePointFormats
+# GREASE values (RFC 8701) are stripped from all fields before logging.
+
+type JA3State: record {
+    version:   count     &default=0;
+    ciphers:   index_vec &default=index_vec();
+    ext_types: index_vec &default=index_vec();
+    curves:    index_vec &default=index_vec();
+    pf:        index_vec &default=index_vec();
+};
+
+global ja3_pending: table[string] of JA3State &read_expire=60sec;
+
+# GREASE values (RFC 8701): both bytes equal, low nibble 0x0A
+function is_grease(v: count): bool {
+    return (v & 0xff) == ((v >> 8) & 0xff) && (v & 0x0f) == 10;
+}
+
+function vec_to_ja3_str(v: index_vec): string {
+    local s = "";
+    for (i in v) {
+        if (is_grease(v[i])) next;
+        if (s != "") s += "-";
+        s += fmt("%d", v[i]);
+    }
+    return s;
+}
+
 event ssl_client_hello(c: connection, version: count, record_version: count,
                        possible_ts: time, client_random: string,
                        session_id: string, ciphers: index_vec,
-                       comp_methods: index_vec) {
+                       comp_methods: index_vec)
+{
+    local st: JA3State;
+    st$version = version;
+    st$ciphers = ciphers;
+    ja3_pending[c$uid] = st;
+}
+
+event ssl_extension(c: connection, is_orig: bool, code: count, val: string)
+{
+    if (!is_orig || c$uid !in ja3_pending) return;
+    local st = ja3_pending[c$uid];
+    st$ext_types[|st$ext_types|] = code;
+    ja3_pending[c$uid] = st;
+}
+
+event ssl_extension_elliptic_curves(c: connection, is_orig: bool, curves: index_vec)
+{
+    if (!is_orig || c$uid !in ja3_pending) return;
+    ja3_pending[c$uid]$curves = curves;
+}
+
+event ssl_extension_ec_point_formats(c: connection, is_orig: bool, point_formats: index_vec)
+{
+    if (!is_orig || c$uid !in ja3_pending) return;
+    ja3_pending[c$uid]$pf = point_formats;
+}
+
+event ssl_established(c: connection)
+{
+    if (c$uid !in ja3_pending) return;
+    local st = ja3_pending[c$uid];
+    delete ja3_pending[c$uid];
+
     local sni = "-";
-    if (c?$ssl && c$ssl?$server_name) sni = c$ssl$server_name;
+    if (c?$ssl && c$ssl?$server_name)
+        sni = c$ssl$server_name;
 
-    local cipher_count = |ciphers|;
-
-    # Chrome sends 15–17 ciphers with GREASE values; flag for manual review
-    local detail = fmt("version=0x%x ciphers=%d sni=%s", version, cipher_count, sni);
+    local ja3_raw = fmt("%d,%s,%s,%s,%s",
+                        st$version,
+                        vec_to_ja3_str(st$ciphers),
+                        vec_to_ja3_str(st$ext_types),
+                        vec_to_ja3_str(st$curves),
+                        vec_to_ja3_str(st$pf));
 
     Log::write(YalerDetect::LOG, YalerDetect::Info(
         $ts         = network_time(),
@@ -117,7 +180,7 @@ event ssl_client_hello(c: connection, version: count, record_version: count,
         $dst        = c$id$resp_h,
         $dport      = c$id$resp_p,
         $proto      = "tls-hello",
-        $detail     = detail,
+        $detail     = fmt("sni=%s ja3_raw=%s", sni, ja3_raw),
         $suspicious = F,
         $score      = 0
     ));

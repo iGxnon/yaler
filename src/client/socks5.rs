@@ -1,51 +1,44 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 use crate::proto::Target;
 
-/// Result of a SOCKS5 handshake.
 pub enum SocksTarget {
-    /// Standard CONNECT tunnel.
     Connect(Target),
-    /// UDP ASSOCIATE: caller receives a bound UDP socket.
-    /// The original TCP control stream (passed to `handshake`) must remain
-    /// open for the lifetime of the UDP association (per RFC 1928 §6).
     UdpAssociate { udp_socket: UdpSocket },
 }
 
-/// Perform the SOCKS5 server-side handshake on `stream` and return the target.
-/// After this call the stream carries raw TCP data (CONNECT) or acts as a
-/// control channel that must remain open (UDP ASSOCIATE).
 pub async fn handshake(stream: &mut TcpStream) -> Result<SocksTarget> {
-    // ── Greeting ─────────────────────────────────────────────────────────────
+    // ── Greeting ───
     let mut hdr = [0u8; 2];
     stream.read_exact(&mut hdr).await?;
-    if hdr[0] != 5 {
-        return Err(anyhow!("not a SOCKS5 client (version byte = {})", hdr[0]));
+    if hdr[0] != 0x5 {
+        anyhow::bail!("not a SOCKS5 client (version byte = {})", hdr[0]);
     }
     let nmethods = hdr[1] as usize;
     let mut methods = vec![0u8; nmethods];
     stream.read_exact(&mut methods).await?;
 
     // Reply: no authentication required
-    stream.write_all(&[5, 0]).await?;
+    stream.write_all(&[0x5, 0x0]).await?;
 
-    // ── Request ───────────────────────────────────────────────────────────────
+    // ── Request ───
     let mut req = [0u8; 4];
     stream.read_exact(&mut req).await?;
-    if req[0] != 5 {
-        return Err(anyhow!("bad SOCKS5 request version"));
+    if req[0] != 0x5 {
+        anyhow::bail!("bad SOCKS5 request version {}", req[0]);
     }
 
     let cmd = req[1];
-    if cmd != 1 && cmd != 3 {
-        stream.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
-        return Err(anyhow!("unsupported SOCKS5 command {}", cmd));
+    if cmd != 0x1 && cmd != 0x3 {
+        stream
+            .write_all(&[0x5, 0x7, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0])
+            .await?;
+        anyhow::bail!("unsupported SOCKS5 command {}", cmd);
     }
 
-    // Read destination address (ignored for UDP ASSOCIATE but required by protocol)
     let host = match req[3] {
         0x01 => {
             let mut ip = [0u8; 4];
@@ -63,21 +56,21 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<SocksTarget> {
             stream.read_exact(&mut ip).await?;
             IpAddr::V6(Ipv6Addr::from(ip)).to_string()
         }
-        t => return Err(anyhow!("unsupported SOCKS5 address type {t}")),
+        t => anyhow::bail!("unsupported SOCKS5 address type {}", t),
     };
     let port = stream.read_u16().await?;
 
-    if cmd == 1 {
-        // CONNECT: reply success, bound address 0.0.0.0:0
-        stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+    if cmd == 0x1 {
+        stream
+            .write_all(&[0x5, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0])
+            .await?;
         return Ok(SocksTarget::Connect(Target { host, port }));
     }
 
-    // UDP ASSOCIATE (cmd == 3):
-    // Bind a local UDP socket and advertise its address to the SOCKS5 client.
+    // UDP ASSOCIATE (cmd == 0x3):
     let udp = UdpSocket::bind("127.0.0.1:0").await?;
     let local_addr = udp.local_addr()?;
-    let mut reply = vec![5u8, 0, 0];
+    let mut reply = vec![0x5u8, 0x0, 0x0];
     reply.extend_from_slice(&encode_socks5_addr(local_addr));
     stream.write_all(&reply).await?;
 

@@ -4,31 +4,26 @@ use tokio::net::TcpStream;
 
 use crate::proto::Target;
 
-/// Result of parsing an HTTP proxy request.
 pub enum HttpRequest {
-    /// CONNECT tunnel — stream is now raw TCP after the 200 reply.
     Connect(Target),
-    /// Plain HTTP forwarding — the full raw request bytes must be forwarded
-    /// to the target before switching to bidirectional relay.
     Forward { target: Target, raw: Vec<u8> },
 }
 
-/// Read one HTTP proxy request from `stream`.
-///
-/// Handles both `CONNECT host:port` (HTTPS tunnel) and
-/// `GET http://host/path` (plain HTTP forwarding).
 pub async fn handshake(stream: &mut TcpStream) -> Result<HttpRequest> {
     let mut buf: Vec<u8> = Vec::with_capacity(512);
-    let mut tmp = [0u8; 1];
+    let mut tmp = [0u8; 64];
 
     loop {
-        stream.read_exact(&mut tmp).await?;
-        buf.push(tmp[0]);
+        let n = stream.read(&mut tmp).await?;
+        if n == 0 {
+            anyhow::bail!("client closed connection during HTTP handshake");
+        }
+        buf.extend_from_slice(&tmp[..n]);
         if buf.ends_with(b"\r\n\r\n") || buf.ends_with(b"\n\n") {
             break;
         }
         if buf.len() > 16384 {
-            return Err(anyhow!("HTTP headers too large"));
+            anyhow::bail!("HTTP headers too large");
         }
     }
 
@@ -38,7 +33,7 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<HttpRequest> {
     let method = parts.next().ok_or_else(|| anyhow!("empty HTTP request"))?;
 
     if method.eq_ignore_ascii_case("CONNECT") {
-        // ── CONNECT tunnel ──────────────────────────────────────────────────
+        // ── CONNECT tunnel ───
         let addr = parts
             .next()
             .ok_or_else(|| anyhow!("missing address in CONNECT"))?;
@@ -48,7 +43,7 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<HttpRequest> {
             .await?;
         Ok(HttpRequest::Connect(target))
     } else {
-        // ── Plain HTTP forwarding ────────────────────────────────────────────
+        // ── Plain HTTP forwarding ───
         // e.g. GET http://example.com/path HTTP/1.1
         let url = parts
             .next()
@@ -83,7 +78,6 @@ fn parse_host_port(addr: &str, default_port: u16) -> Result<Target> {
 }
 
 fn parse_absolute_url(url: &str) -> Result<Target> {
-    // Strip scheme
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))

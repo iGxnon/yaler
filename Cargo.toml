@@ -3,6 +3,10 @@ name = "yaler"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "yaler"
+path = "src/lib.rs"
+
 [[bin]]
 name = "yaler-server"
 path = "src/bin/server.rs"
@@ -11,45 +15,26 @@ path = "src/bin/server.rs"
 name = "yaler-client"
 path = "src/bin/client.rs"
 
-[lib]
-name = "yaler"
-path = "src/lib.rs"
-
 [dependencies]
-# Async runtime
-tokio = { version = "1", features = ["full"] }
-
-# WebSocket — client side uses tokio-tungstenite over a pre-built TLS stream
-tokio-tungstenite = "0.21"
-tungstenite = "0.21"
+anyhow = "1"
+boring = "5"
+boring-sys = "5"
+brotli = "8.0.2"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
-
-# HTTP / WebSocket server
-axum = { version = "0.8", features = ["ws"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
-
-# Server-side TLS (rustls)
-rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-tungstenite = "0.13"
+hyper-util = { version = "0.1", features = ["tokio"] }
+lru = "0.17.0"
+rand = "0.8"
 rcgen = "0.11"
-
-# Client-side TLS — BoringSSL enables Chrome TLS fingerprint (uTLS)
-boring = "4"
-tokio-boring = "4"
-
-# Config / serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.21"
 toml = "0.8"
-
-# CLI
-clap = { version = "4", features = ["derive"] }
-
-# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Utilities
-anyhow = "1"
-bytes = "1"
-rand = "0.8"
+tungstenite = "0.21"

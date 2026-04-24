@@ -14,10 +14,6 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("failed to install rustls crypto provider");
-
     let args = Args::parse();
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {

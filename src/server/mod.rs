@@ -1,69 +1,106 @@
 mod handler;
-pub mod udp;
+
+use std::convert::Infallible;
+use std::sync::Arc;
 
 use anyhow::Result;
-use axum::{
-    extract::{FromRequestParts, Request, State, WebSocketUpgrade},
-    http::StatusCode,
-    response::{Html, IntoResponse, Response},
-    routing::any,
-    Router,
-};
-use axum_server::tls_rustls::RustlsConfig;
-use std::sync::Arc;
-use tracing::info;
+use boring::ssl::{SslAcceptor as BoringAcceptor, SslFiletype, SslMethod};
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::{Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpListener;
+use tracing::{error, info, warn};
 
 use crate::config::ServerConfig;
-
-#[derive(Clone)]
-struct AppState {
-    password: Arc<String>,
-}
+use crate::ssl::SslAcceptor;
 
 pub async fn run(cfg: ServerConfig) -> Result<()> {
-    let state = AppState {
-        password: Arc::new(cfg.password.clone()),
-    };
-
-    let path = cfg.path.clone();
-    let app = Router::new()
-        .route(&path, any(ws_handler))
-        .fallback(fallback_handler)
-        .with_state(state);
-
-    let tls = build_tls_config(&cfg).await?;
+    let acceptor = Arc::new(build_tls_acceptor(&cfg)?);
+    let listener = TcpListener::bind(&cfg.listen).await?;
+    let cfg = Arc::new(cfg);
 
     info!("server listening on {}", cfg.listen);
-    axum_server::bind_rustls(cfg.listen.parse()?, tls)
-        .serve(app.into_make_service())
-        .await?;
 
-    Ok(())
-}
+    loop {
+        let (tcp_stream, _addr) = listener.accept().await?;
+        let acceptor = acceptor.clone();
+        let cfg = cfg.clone();
 
-async fn ws_handler(State(state): State<AppState>, req: Request) -> Response {
-    let (mut parts, _body) = req.into_parts();
-    match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
-        Ok(ws) => {
-            let pw = state.password.as_ref().clone();
-            ws.on_upgrade(move |socket| handler::handle(socket, pw))
-        }
-        Err(_) => fallback_handler().await.into_response(),
+        tokio::spawn(async move {
+            let ssl_stream = match acceptor.accept(tcp_stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("TLS handshake failed: {e}");
+                    return;
+                }
+            };
+
+            let io = TokioIo::new(ssl_stream);
+            let connection = http1::Builder::new()
+                .serve_connection(io, service_fn(move |req| handle_request(req, cfg.clone())))
+                .with_upgrades();
+            if let Err(e) = connection.await {
+                error!("HTTP connection error: {e}");
+            }
+        });
     }
 }
 
-/// Return a realistic nginx default page for any non-WebSocket request.
-/// This defeats active probing: the server looks like a normal HTTPS site.
-async fn fallback_handler() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [
-            ("content-type", "text/html; charset=utf-8"),
-            ("server", "nginx/1.24.0"),
-            ("x-content-type-options", "nosniff"),
-        ],
-        Html(NGINX_DEFAULT_PAGE),
-    )
+async fn handle_request(
+    mut req: Request<Incoming>,
+    cfg: Arc<ServerConfig>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
+    if req.uri().path() == cfg.path {
+        if let Ok((response, websocket)) = hyper_tungstenite::upgrade(&mut req, None) {
+            let password = cfg.password.clone();
+            tokio::spawn(async move {
+                match websocket.await {
+                    Ok(ws) => handler::handle(ws, password).await,
+                    Err(e) => error!("WS handshake error: {e}"),
+                }
+            });
+            return Ok(response.map(|_| Full::new(Bytes::new())));
+        }
+    }
+
+    Ok(nginx_response())
+}
+
+fn build_tls_acceptor(cfg: &ServerConfig) -> Result<SslAcceptor> {
+    let mut builder = BoringAcceptor::mozilla_modern(SslMethod::tls())?;
+
+    match (&cfg.cert, &cfg.key) {
+        (Some(cert_path), Some(key_path)) => {
+            builder.set_certificate_file(cert_path, SslFiletype::PEM)?;
+            builder.set_private_key_file(key_path, SslFiletype::PEM)?;
+        }
+        _ => {
+            let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+            let cert_pem = cert.serialize_pem()?;
+            let key_pem = cert.serialize_private_key_pem();
+            warn!("using auto-generated self-signed certificate");
+            let x509 = boring::x509::X509::from_pem(cert_pem.as_bytes())?;
+            builder.set_certificate(&x509)?;
+            let pkey = boring::pkey::PKey::private_key_from_pem(key_pem.as_bytes())?;
+            builder.set_private_key(&pkey)?;
+        }
+    }
+
+    Ok(SslAcceptor::new(builder.build()))
+}
+
+fn nginx_response() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .header("server", "nginx/1.24.0")
+        .header("x-content-type-options", "nosniff")
+        .body(Full::new(Bytes::from(NGINX_DEFAULT_PAGE)))
+        .unwrap()
 }
 
 const NGINX_DEFAULT_PAGE: &str = r#"<!DOCTYPE html>
@@ -90,16 +127,3 @@ Commercial support is available at
 </body>
 </html>
 "#;
-
-async fn build_tls_config(cfg: &ServerConfig) -> Result<RustlsConfig> {
-    match (&cfg.cert, &cfg.key) {
-        (Some(cert), Some(key)) => Ok(RustlsConfig::from_pem_file(cert, key).await?),
-        _ => {
-            let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
-            let cert_pem = cert.serialize_pem()?;
-            let key_pem = cert.serialize_private_key_pem();
-            tracing::warn!("using auto-generated self-signed certificate");
-            Ok(RustlsConfig::from_pem(cert_pem.into_bytes(), key_pem.into_bytes()).await?)
-        }
-    }
-}
