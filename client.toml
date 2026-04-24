@@ -6,3 +6,4 @@ path        = "/ws"
 password    = "testpass"
 sni         = "localhost"
 skip_verify = true   # self-signed cert in dev
+pool_size   = 64

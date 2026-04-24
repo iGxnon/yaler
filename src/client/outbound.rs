@@ -18,7 +18,7 @@ pub async fn connect(
         .await
         .with_context(|| format!("TCP connect to {server}:{port}"))?;
 
-    let config = build_ssl_config(sni, skip_verify)?;
+    let config = build_ssl_config(skip_verify)?;
     let tls = tokio_boring::connect(config, sni, tcp)
         .await
         .map_err(|e| anyhow::anyhow!("TLS handshake: {e:#?}"))?;
@@ -40,7 +40,7 @@ pub async fn connect(
 /// Chrome is built on BoringSSL, so BoringSSL defaults already produce the
 /// correct GREASE values and extension ordering.  We additionally pin the
 /// cipher suite list and ALPN to match a recent Chrome release.
-fn build_ssl_config(sni: &str, skip_verify: bool) -> Result<boring::ssl::ConnectConfiguration> {
+fn build_ssl_config(skip_verify: bool) -> Result<boring::ssl::ConnectConfiguration> {
     let mut builder =
         SslConnector::builder(SslMethod::tls_client()).context("SslConnector builder")?;
 
@@ -79,7 +79,5 @@ fn build_ssl_config(sni: &str, skip_verify: bool) -> Result<boring::ssl::Connect
     let connector = builder.build();
     let mut config = connector.configure().context("SslConnector configure")?;
     config.set_verify_hostname(!skip_verify);
-    // SNI is passed separately to tokio_boring::connect
-    let _ = sni;
     Ok(config)
 }

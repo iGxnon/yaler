@@ -39,14 +39,20 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<HttpRequest> {
 
     if method.eq_ignore_ascii_case("CONNECT") {
         // ── CONNECT tunnel ──────────────────────────────────────────────────
-        let addr = parts.next().ok_or_else(|| anyhow!("missing address in CONNECT"))?;
+        let addr = parts
+            .next()
+            .ok_or_else(|| anyhow!("missing address in CONNECT"))?;
         let target = parse_host_port(addr, 443)?;
-        stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
         Ok(HttpRequest::Connect(target))
     } else {
         // ── Plain HTTP forwarding ────────────────────────────────────────────
         // e.g. GET http://example.com/path HTTP/1.1
-        let url = parts.next().ok_or_else(|| anyhow!("missing URL in {method}"))?;
+        let url = parts
+            .next()
+            .ok_or_else(|| anyhow!("missing URL in {method}"))?;
         let target = parse_absolute_url(url)?;
 
         // Rewrite the request line to strip the absolute URI → relative path,

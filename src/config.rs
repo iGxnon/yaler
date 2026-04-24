@@ -43,6 +43,13 @@ pub struct ClientConfig {
     /// Skip TLS certificate verification (dev only)
     #[serde(default)]
     pub skip_verify: bool,
+    /// Maximum number of idle WebSocket connections kept in the pool
+    #[serde(default = "default_pool_size")]
+    pub pool_size: usize,
+}
+
+fn default_pool_size() -> usize {
+    64
 }
 
 impl Default for ClientConfig {
@@ -55,6 +62,7 @@ impl Default for ClientConfig {
             password: "changeme".to_string(),
             sni: "example.com".to_string(),
             skip_verify: false,
+            pool_size: default_pool_size(),
         }
     }
 }

@@ -51,11 +51,7 @@ async fn build_tls_config(cfg: &ServerConfig) -> Result<RustlsConfig> {
             let cert_pem = cert.serialize_pem()?;
             let key_pem = cert.serialize_private_key_pem();
             tracing::warn!("using auto-generated self-signed certificate");
-            Ok(RustlsConfig::from_pem(
-                cert_pem.into_bytes(),
-                key_pem.into_bytes(),
-            )
-            .await?)
+            Ok(RustlsConfig::from_pem(cert_pem.into_bytes(), key_pem.into_bytes()).await?)
         }
     }
 }

@@ -56,9 +56,7 @@ pub async fn handshake(stream: &mut TcpStream) -> Result<Target> {
     let port = stream.read_u16().await?;
 
     // Reply: success, bound address 0.0.0.0:0
-    stream
-        .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
-        .await?;
+    stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
 
     Ok(Target { host, port })
 }

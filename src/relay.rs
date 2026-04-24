@@ -1,46 +1,120 @@
-use anyhow::Result;
+use std::future::Future;
+
+use anyhow::{anyhow, Result};
+use axum::extract::ws;
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
+use tokio_tungstenite::{tungstenite, WebSocketStream};
 
-/// Bidirectional relay between a tungstenite WebSocketStream and a raw TcpStream.
-///
-/// Used on the **client** side: ws is the tunnel to the remote server,
-/// tcp is the inbound connection from the local user application.
-pub async fn relay_ws_tcp<S>(ws: WebSocketStream<S>, tcp: TcpStream) -> Result<()>
+use crate::proto::{FRAME_DATA, FRAME_EOF};
+
+pub enum WsRecv {
+    Data(Vec<u8>),
+    Closed,
+    Err(anyhow::Error),
+}
+
+/// Abstracts over axum's WebSocket and tungstenite's WebSocketStream so that
+/// relay_session can be shared between the server and client without duplication.
+pub trait WsTunnel: Send {
+    fn ws_recv(&mut self) -> impl Future<Output = WsRecv> + Send + '_;
+    fn ws_send(&mut self, data: Vec<u8>) -> impl Future<Output = Result<()>> + Send + '_;
+}
+
+impl<S> WsTunnel for WebSocketStream<S>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
 {
-    let (mut ws_tx, mut ws_rx) = ws.split();
-    let (mut tcp_rx, mut tcp_tx) = tcp.into_split();
-
-    let ws_to_tcp = async move {
-        while let Some(msg) = ws_rx.next().await {
-            match msg? {
-                Message::Binary(data) => tcp_tx.write_all(&data).await?,
-                Message::Close(_) => break,
-                _ => {}
-            }
-        }
-        Ok::<_, anyhow::Error>(())
-    };
-
-    let tcp_to_ws = async move {
-        let mut buf = vec![0u8; 65536];
+    async fn ws_recv(&mut self) -> WsRecv {
         loop {
-            let n = tcp_rx.read(&mut buf).await?;
-            if n == 0 {
-                break;
+            match StreamExt::next(self).await {
+                None => return WsRecv::Closed,
+                Some(Ok(tungstenite::Message::Binary(b))) => return WsRecv::Data(b),
+                Some(Ok(tungstenite::Message::Close(_))) => return WsRecv::Closed,
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return WsRecv::Err(e.into()),
             }
-            ws_tx.send(Message::Binary(buf[..n].to_vec())).await?;
         }
-        ws_tx.close().await.ok();
-        Ok::<_, anyhow::Error>(())
-    };
-
-    tokio::select! {
-        r = ws_to_tcp => r,
-        r = tcp_to_ws => r,
     }
+
+    async fn ws_send(&mut self, data: Vec<u8>) -> Result<()> {
+        SinkExt::send(self, tungstenite::Message::Binary(data))
+            .await
+            .map_err(Into::into)
+    }
+}
+
+impl WsTunnel for ws::WebSocket {
+    async fn ws_recv(&mut self) -> WsRecv {
+        loop {
+            // UFCS to call the inherent method, not this trait method.
+            match ws::WebSocket::recv(self).await {
+                None => return WsRecv::Closed,
+                Some(Ok(ws::Message::Binary(b))) => return WsRecv::Data(b.to_vec()),
+                Some(Ok(ws::Message::Close(_))) => return WsRecv::Closed,
+                Some(Ok(_)) => continue,
+                Some(Err(e)) => return WsRecv::Err(e.into()),
+            }
+        }
+    }
+
+    async fn ws_send(&mut self, data: Vec<u8>) -> Result<()> {
+        self.send(ws::Message::Binary(Bytes::from(data)))
+            .await
+            .map_err(Into::into)
+    }
+}
+
+/// Bidirectional relay between any WsTunnel and a TcpStream.
+///
+/// Binary frames are prefixed with FRAME_DATA or FRAME_EOF for application-level
+/// session boundaries. Returns Ok(()) with `ws` still open so the caller can
+/// return it to a connection pool.
+pub async fn relay_session<W: WsTunnel>(ws: &mut W, tcp: TcpStream) -> Result<()> {
+    let (mut tcp_rx, mut tcp_tx) = tcp.into_split();
+    let mut buf = vec![0u8; 65536];
+    let mut ws_eof = false;
+    let mut tcp_eof = false;
+
+    loop {
+        if ws_eof && tcp_eof {
+            break;
+        }
+
+        tokio::select! {
+            frame = ws.ws_recv(), if !ws_eof => {
+                match frame {
+                    WsRecv::Data(data) => {
+                        if data.is_empty() { continue; }
+                        match data[0] {
+                            FRAME_DATA => tcp_tx.write_all(&data[1..]).await?,
+                            FRAME_EOF => {
+                                tcp_tx.shutdown().await.ok();
+                                ws_eof = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                    WsRecv::Closed => return Err(anyhow!("WS connection closed unexpectedly")),
+                    WsRecv::Err(e) => return Err(e),
+                }
+            }
+            result = tcp_rx.read(&mut buf), if !tcp_eof => {
+                let n = result?;
+                if n == 0 {
+                    ws.ws_send(vec![FRAME_EOF]).await?;
+                    tcp_eof = true;
+                } else {
+                    let mut frame = Vec::with_capacity(1 + n);
+                    frame.push(FRAME_DATA);
+                    frame.extend_from_slice(&buf[..n]);
+                    ws.ws_send(frame).await?;
+                }
+            }
+        }
+    }
+
+    Ok(())
 }

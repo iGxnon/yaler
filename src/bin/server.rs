@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser)]
 #[command(about = "Yaler server — HTTPS/WebSocket tunnel endpoint")]
