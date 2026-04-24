@@ -13,7 +13,7 @@ pub async fn handle(mut ws: WebSocket, password: String) {
         // strict about this per spec, but it is not a real error — treat it as
         // a normal close.
         let s = format!("{e:#}");
-        if s.contains("close_notify") {
+        if s.contains("close_notify") || s.contains("Connection reset without closing handshake") {
             return;
         }
         error!("handler: {e:#}");

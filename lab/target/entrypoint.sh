@@ -1,0 +1,4 @@
+#!/bin/sh
+# Target nginx must route responses back to the frontend through middlebox.
+ip route add 10.1.0.0/24 via 10.2.0.2 2>/dev/null || true
+exec nginx -g "daemon off;"

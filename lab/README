@@ -1,0 +1,16 @@
+---
+cd lab
+
+docker compose build
+
+docker compose up -d
+
+docker exec -it lab-middlebox-1 tail -f /logs/zeek/yaler_detect.log
+docker exec -it lab-middlebox-1 tail -f /logs/zeek/ssl.log
+docker exec -it lab-middlebox-1 tail -f /logs/zeek/http.log
+
+docker exec -it lab-traffic-gen-1 /lab/gen-normal.sh
+docker exec -it lab-traffic-gen-1 /lab/gen-tunnel.sh
+
+docker exec -it lab-middlebox-1 /analyze.sh
+---

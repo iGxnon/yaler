@@ -1,0 +1,115 @@
+version: "3.9"
+
+# ──────────────────────────────────────────────
+#  Network topology
+#
+#  [traffic-gen 10.1.0.11]  [yaler-client 10.1.0.10]
+#            │                        │
+#       ─────────── frontend 10.1.0.0/24 ───────────
+#                            │
+#                   [middlebox 10.1.0.2 / 10.2.0.2]
+#                            │
+#       ─────────── backend  10.2.0.0/24 ───────────
+#            │                        │
+#  [target   10.2.0.11]  [yaler-server 10.2.0.10]
+#
+#  All client→server traffic must pass through middlebox.
+# ──────────────────────────────────────────────
+
+networks:
+  frontend:
+    ipam:
+      config:
+        - subnet: 10.1.0.0/24
+          gateway: 10.1.0.1   # Docker bridge on host
+  backend:
+    ipam:
+      config:
+        - subnet: 10.2.0.0/24
+          gateway: 10.2.0.1   # Docker bridge on host
+
+x-yaler-build: &yaler-build
+  build:
+    context: ..
+    dockerfile: lab/Dockerfile
+  image: yaler:lab
+  stop_grace_period: 1s
+
+services:
+
+  # ── Middlebox───────────
+  middlebox:
+    build:
+      context: ./middlebox
+    stop_grace_period: 1s
+    cap_add: [NET_ADMIN, NET_RAW]
+    sysctls:
+      net.ipv4.ip_forward: 1
+    networks:
+      frontend:
+        ipv4_address: 10.1.0.2
+      backend:
+        ipv4_address: 10.2.0.2
+    volumes:
+      - ./middlebox/zeek:/opt/zeek/share/zeek/site:ro
+      - ./logs:/logs
+    environment:
+      - CLIENT_IFACE=eth0
+      - SERVER_IFACE=eth1
+
+  # ── Target HTTP server ─────────────────────────
+  target:
+    build:
+      context: ./target
+    stop_grace_period: 1s
+    cap_add: [NET_ADMIN]
+    networks:
+      backend:
+        ipv4_address: 10.2.0.11
+    depends_on:
+      - middlebox
+
+  # ── Yaler server ──────────────────────────────
+  yaler-server:
+    <<: *yaler-build
+    entrypoint: ["/lab/entrypoint.sh"]
+    command: ["yaler-server", "--config", "/etc/yaler/server.toml", "--verbose"]
+    cap_add: [NET_ADMIN]
+    networks:
+      backend:
+        ipv4_address: 10.2.0.10
+    volumes:
+      - ./configs/server.toml:/etc/yaler/server.toml:ro
+      - ./server/entrypoint.sh:/lab/entrypoint.sh:ro
+    depends_on:
+      - middlebox
+      - target
+
+  # ── Yaler client ──────────────────────────────
+  yaler-client:
+    <<: *yaler-build
+    entrypoint: ["/lab/entrypoint.sh"]
+    command: ["yaler-client", "--config", "/etc/yaler/client.toml", "--verbose"]
+    cap_add: [NET_ADMIN]
+    networks:
+      frontend:
+        ipv4_address: 10.1.0.10
+    volumes:
+      - ./configs/client.toml:/etc/yaler/client.toml:ro
+      - ./client/entrypoint.sh:/lab/entrypoint.sh:ro
+    depends_on:
+      - yaler-server
+
+  # ── Traffic generator (exec into this to run scenarios) ──
+  traffic-gen:
+    <<: *yaler-build
+    entrypoint: ["/lab/entrypoint.sh"]
+    command: ["sleep", "infinity"]
+    cap_add: [NET_ADMIN]
+    networks:
+      frontend:
+        ipv4_address: 10.1.0.11
+    volumes:
+      - ./traffic-gen:/lab:ro
+    depends_on:
+      - yaler-client
