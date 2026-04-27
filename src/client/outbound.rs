@@ -204,25 +204,27 @@ fn build_ssl(url: &str, sni: &str, skip_verify: bool, cache: Arc<TlsSessionCache
     ssl.set_enable_ech_grease(true);
 
     // Set ALPN: h2 preferred, then http/1.1 (Chrome order)
-    ssl.set_alpn_protos(b"\x02h2\x08http/1.1")?;
+    // ssl.set_alpn_protos(b"\x02h2\x08http/1.1")?;
+    //
+    ssl.set_alpn_protos(b"\x08http/1.1")?;
 
     // Set ALPS
     // Not standardize, only chrome can do
-    unsafe {
-        let ssl_st = ssl.as_mut() as *const _ as *mut _;
-        let alps = b"h2";
-        let rt = boring_sys::SSL_add_application_settings(
-            ssl_st,
-            alps.as_ptr(),
-            alps.len(),
-            std::ptr::null(),
-            0,
-        );
-        if rt <= 0 {
-            return Err(ErrorStack::get().into());
-        }
-        boring_sys::SSL_set_alps_use_new_codepoint(ssl_st, 1);
-    }
+    // unsafe {
+    //     let ssl_st = ssl.as_mut() as *const _ as *mut _;
+    //     let alps = b"h2";
+    //     let rt = boring_sys::SSL_add_application_settings(
+    //         ssl_st,
+    //         alps.as_ptr(),
+    //         alps.len(),
+    //         std::ptr::null(),
+    //         0,
+    //     );
+    //     if rt <= 0 {
+    //         return Err(ErrorStack::get().into());
+    //     }
+    //     boring_sys::SSL_set_alps_use_new_codepoint(ssl_st, 1);
+    // }
 
     if let Some(session) = cache.pop(url) {
         unsafe { ssl.set_session(&session.0) }?;
